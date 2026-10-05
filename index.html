@@ -218,6 +218,15 @@ table.gt.wide td:first-child{white-space:normal}
 .ed-help{display:flex;flex-wrap:wrap;gap:4px 14px;margin:10px 0 12px;font-size:12px;color:var(--muted)}
 .ed-help code{background:var(--paper);border:1px solid var(--rule-soft);border-radius:2px;
   padding:1px 5px;font-size:11.5px;color:var(--ink)}
+details.setup{border:1px solid var(--rule-soft);border-radius:3px;padding:10px 14px;background:var(--surface-2)}
+details.setup summary{cursor:pointer;font-weight:500;font-size:14.5px}
+details.setup ol{margin:10px 0 2px;padding-left:20px;font-size:14px;color:var(--ink-2)}
+details.setup li{margin:6px 0}
+details.setup code{background:var(--paper);border:1px solid var(--rule-soft);border-radius:2px;padding:0 4px;font-size:12.5px}
+.sync-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.sync-form label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}
+.sync-form input{padding:9px 11px;border:1px solid var(--rule);border-radius:3px;
+  font-size:16px;font-family:inherit;color:var(--ink);background:var(--paper)}
 .topic-foot{display:flex;justify-content:space-between;gap:12px;margin-top:32px;
   border-top:1px solid var(--rule-soft);padding-top:16px}
 
@@ -380,6 +389,7 @@ let S = {
   units:[],        // selected unit names, [] = all
   gen:0,           // generated-question counter (for stable ids)
   edits:{},        // "<topic>|<section>" -> user-edited blocks
+  editsAt:{},      // "<topic>|<section>" -> time of last edit or restore (for sync)
   last:null
 };
 
@@ -388,6 +398,7 @@ function persist(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     const ok = await Store.save(S);
+    if (typeof Sync !== 'undefined' && Sync.on()){ Sync.schedule(); return; }
     const el = document.getElementById('savenote');
     if (el) el.textContent = ok ? '180 topics · progress saved'
                                 : '180 topics · progress not saved in this preview';
@@ -623,8 +634,10 @@ function rebuildPools(){
 function saveEdit(n, idx, text){
   const blocks = fromMarkup(text);
   S.edits = S.edits || {};
+  S.editsAt = S.editsAt || {};
   if (!blocks.length){ delete S.edits[n + '|' + idx]; }
   else { S.edits[n + '|' + idx] = blocks; }
+  S.editsAt[n + '|' + idx] = Date.now();
   persist();
   indexTopic(T[n]);
   rebuildPools();
@@ -632,6 +645,8 @@ function saveEdit(n, idx, text){
 
 function resetEdit(n, idx){
   if (S.edits) delete S.edits[n + '|' + idx];
+  S.editsAt = S.editsAt || {};
+  S.editsAt[n + '|' + idx] = Date.now();
   persist();
   indexTopic(T[n]);
   rebuildPools();
@@ -971,6 +986,346 @@ function generate(n, allowedTopics){
   }
   return out;
 }
+
+/* ============================ GitHub sync ============================
+   Progress and section edits are mirrored to a JSON file in a (private)
+   GitHub repository through the contents API. The token is kept only in
+   this browser's storage and is never included in backups or the synced
+   file. Merging is field-by-field, so two devices don't overwrite each other.
+   ===================================================================== */
+
+const SYNC_KEY = 'pocketgrammar.sync';
+
+function b64enc(str){
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function b64dec(b64){
+  const bin = atob(String(b64).replace(/\s/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// key-order-independent serialisation, for "did anything change?" checks
+function stable(v){
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
+  return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}';
+}
+
+// the part of S that is worth syncing (device preferences stay local)
+function syncPayload(s){
+  return { q: s.q || {}, days: s.days || {}, read: s.read || {},
+           edits: s.edits || {}, editsAt: s.editsAt || {}, gen: s.gen || 0 };
+}
+
+// merge two copies without losing work done on either device
+function mergeState(a, b){
+  const out = { q: {}, days: {}, read: {}, edits: {}, editsAt: {}, gen: 0 };
+  const tries = r => (r.c || 0) + (r.w || 0);
+
+  const qa = a.q || {}, qb = b.q || {};
+  Object.keys(qa).concat(Object.keys(qb)).forEach(id => {
+    const x = qa[id], y = qb[id];
+    if (!x) { out.q[id] = y; return; }
+    if (!y) { out.q[id] = x; return; }
+    // more history wins; on a tie, the one reviewed more recently
+    out.q[id] = tries(x) > tries(y) ? x
+              : tries(y) > tries(x) ? y
+              : ((x.d || 0) >= (y.d || 0) ? x : y);
+  });
+
+  const da = a.days || {}, db = b.days || {};
+  Object.keys(da).concat(Object.keys(db)).forEach(d => {
+    const x = da[d], y = db[d];
+    out.days[d] = !x ? y : !y ? x : { a: Math.max(x.a, y.a), c: Math.max(x.c, y.c) };
+  });
+
+  Object.assign(out.read, b.read || {}, a.read || {});
+
+  const ea = a.edits || {}, eb = b.edits || {};
+  const ta = a.editsAt || {}, tb = b.editsAt || {};
+  const keys = {};
+  [ea, eb, ta, tb].forEach(o => Object.keys(o).forEach(k => { keys[k] = 1; }));
+  Object.keys(keys).forEach(k => {
+    const t1 = ta[k] || 0, t2 = tb[k] || 0;
+    let src;
+    if (t1 > t2) src = ea;                       // newer change wins, including a restore
+    else if (t2 > t1) src = eb;
+    else src = ea[k] ? ea : eb;                  // no timestamps: keep whichever has it
+    if (src[k]) out.edits[k] = src[k];
+    if (t1 || t2) out.editsAt[k] = Math.max(t1, t2);
+  });
+
+  out.gen = Math.max(a.gen || 0, b.gen || 0);
+  return out;
+}
+
+const Sync = {
+  cfg: null, sha: null, timer: null, busy: false, again: false,
+  state: 'off', note: '', last: 0,
+
+  load(){
+    try{ this.cfg = JSON.parse(localStorage.getItem(SYNC_KEY) || 'null'); }
+    catch(e){ this.cfg = null; }
+  },
+  store(cfg){
+    this.cfg = cfg;
+    try{
+      if (cfg) localStorage.setItem(SYNC_KEY, JSON.stringify(cfg));
+      else localStorage.removeItem(SYNC_KEY);
+    }catch(e){}
+  },
+  on(){ return !!(this.cfg && this.cfg.token && this.cfg.owner && this.cfg.repo); },
+
+  api(rest){
+    const c = this.cfg;
+    return 'https://api.github.com/repos/' + encodeURIComponent(c.owner) + '/'
+         + encodeURIComponent(c.repo) + (rest || '');
+  },
+  fileUrl(){
+    return this.api('/contents/' + this.cfg.path.split('/').map(encodeURIComponent).join('/'));
+  },
+  headers(extra){
+    return Object.assign({
+      'Authorization': 'Bearer ' + this.cfg.token,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }, extra || {});
+  },
+
+  setStatus(state, note){
+    this.state = state; this.note = note || '';
+    const el = document.getElementById('savenote');
+    if (!el) return;
+    const t = new Date(this.last || Date.now());
+    const hm = t.getHours() + ':' + String(t.getMinutes()).padStart(2, '0');
+    el.textContent =
+      state === 'syncing' ? '180 topics \u00b7 syncing\u2026' :
+      state === 'ok'      ? '180 topics \u00b7 synced ' + hm :
+      state === 'offline' ? '180 topics \u00b7 offline \u2014 will sync later' :
+      state === 'error'   ? '180 topics \u00b7 sync problem \u2014 see Progress' :
+                            el.textContent;
+    const p = document.getElementById('sync-status');
+    if (p) p.textContent = this.describe();
+  },
+  describe(){
+    if (!this.on()) return 'Not connected.';
+    const where = this.cfg.owner + '/' + this.cfg.repo;
+    if (this.state === 'error') return 'Connected to ' + where + ' \u2014 ' + this.note;
+    if (this.state === 'offline') return 'Connected to ' + where + ' \u2014 offline, changes will sync when you\u2019re back online.';
+    if (this.state === 'syncing') return 'Connected to ' + where + ' \u2014 syncing\u2026';
+    if (!this.last) return 'Connected to ' + where + '.';
+    const t = new Date(this.last);
+    return 'Connected to ' + where + ' \u2014 last synced ' + t.toLocaleString();
+  },
+
+  explain(status, body){
+    if (status === 401) return 'the token was rejected \u2014 it may have expired.';
+    if (status === 403) return /rate limit/i.test(body || '')
+      ? 'GitHub\u2019s rate limit was hit \u2014 it will retry later.'
+      : 'the token can\u2019t write to this repository. Check it has Contents: Read and write.';
+    if (status === 404) return 'repository not found, or the token can\u2019t see it.';
+    return 'GitHub returned an error (' + status + ').';
+  },
+
+  async pull(){
+    const r = await fetch(this.fileUrl() + '?ref=' + encodeURIComponent(this.cfg.branch),
+                          { headers: this.headers(), cache: 'no-store' });
+    if (r.status === 404){ this.sha = null; return null; }      // no file yet
+    if (!r.ok) throw { status: r.status, body: await r.text() };
+    const j = await r.json();
+    this.sha = j.sha;
+    let text = j.encoding === 'base64' && j.content ? b64dec(j.content) : '';
+    if (!text){
+      const raw = await fetch(this.fileUrl() + '?ref=' + encodeURIComponent(this.cfg.branch),
+        { headers: this.headers({ 'Accept': 'application/vnd.github.raw+json' }), cache: 'no-store' });
+      if (!raw.ok) throw { status: raw.status, body: await raw.text() };
+      text = await raw.text();
+    }
+    const data = JSON.parse(text);
+    return data && data.state ? data.state : null;
+  },
+
+  async put(payload){
+    const body = {
+      message: 'Sync progress ' + new Date().toISOString().slice(0, 16).replace('T', ' '),
+      content: b64enc(JSON.stringify({ app: 'pocket-grammar', v: 1, at: Date.now(), state: payload }, null, 1)),
+      branch: this.cfg.branch
+    };
+    if (this.sha) body.sha = this.sha;
+    const r = await fetch(this.fileUrl(), {
+      method: 'PUT', headers: this.headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    });
+    if (r.status === 409 || r.status === 422) return 'conflict';
+    if (!r.ok) throw { status: r.status, body: await r.text() };
+    const j = await r.json();
+    this.sha = j.content && j.content.sha;
+    return 'ok';
+  },
+
+  // pull, merge into S, push the result if it differs from GitHub's copy
+  async run(){
+    if (!this.on()) return;
+    if (this.busy){ this.again = true; return; }
+    this.busy = true;
+    this.setStatus('syncing');
+    try{
+      for (let attempt = 0; attempt < 3; attempt++){
+        const remote = await this.pull();
+        const local = syncPayload(S);
+        const merged = remote ? mergeState(local, remote) : local;
+        if (stable(merged) !== stable(local)) applyMerged(merged);
+        if (remote && stable(merged) === stable(remote)) break;   // nothing to push
+        const res = await this.put(merged);
+        if (res === 'ok') break;
+        // someone else wrote in between - go round again with fresh data
+      }
+      this.last = Date.now();
+      this.setStatus('ok');
+    }catch(e){
+      if (e && e.status) this.setStatus('error', this.explain(e.status, e.body));
+      else this.setStatus(navigator.onLine === false ? 'offline' : 'error',
+                          'couldn\u2019t reach GitHub.');
+    }finally{
+      this.busy = false;
+      if (this.again){ this.again = false; this.schedule(1500); }
+    }
+  },
+
+  schedule(ms){
+    if (!this.on()) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.run(), ms == null ? 4000 : ms);
+  }
+};
+
+// bring merged data into the live app without disturbing a quiz or the editor
+function applyMerged(m){
+  const editsChanged = stable(m.edits) !== stable(S.edits || {});
+  S.q = m.q; S.days = m.days; S.read = m.read;
+  S.edits = m.edits; S.editsAt = m.editsAt;
+  S.gen = Math.max(S.gen || 0, m.gen || 0);
+  Store.save(S);
+  if (editsChanged){ TOPICS.forEach(indexTopic); rebuildPools(); }
+  if (!session && !editing) render();
+}
+
+/* ---------------- settings panel (rendered inside Progress) ---------------- */
+function syncPanelHTML(){
+  if (Sync.on()){
+    return `<section class="panel pad stack">
+      <h3 style="font-family:var(--serif);font-size:20px">Sync across devices</h3>
+      <p class="lede" id="sync-status" style="margin:0">${esc(Sync.describe())}</p>
+      <div class="btnrow">
+        <button class="btn ghost sm" id="sync-now">Sync now</button>
+        <button class="btn ghost sm" id="sync-off">Disconnect this device</button>
+      </div>
+      <p class="eyebrow" style="margin:0">Changes sync a few seconds after you make them,
+        and again whenever you come back to the app.</p>
+    </section>`;
+  }
+  const c = Sync.cfg || {};
+  return `<section class="panel pad stack">
+    <h3 style="font-family:var(--serif);font-size:20px">Sync across devices</h3>
+    <p class="lede" style="margin:0">Keep progress and section edits the same on your Mac and
+      iPhone by storing them in a private GitHub repository.</p>
+    <details class="setup">
+      <summary>How to set it up (about 5 minutes, once)</summary>
+      <ol>
+        <li>On GitHub, create a <b>new private repository</b> \u2014 for example
+          <code>grammar-data</code>. Tick <em>Add a README</em> so it isn\u2019t empty.</li>
+        <li>Go to your profile picture \u2192 <b>Settings</b> \u2192 <b>Developer settings</b> \u2192
+          <b>Personal access tokens</b> \u2192 <b>Fine-grained tokens</b> \u2192
+          <b>Generate new token</b>.</li>
+        <li>Give it a name, choose an expiry (a year is reasonable), then under
+          <b>Repository access</b> pick <em>Only select repositories</em> and choose
+          <code>grammar-data</code>.</li>
+        <li>Under <b>Permissions \u2192 Repository permissions</b>, set
+          <b>Contents</b> to <em>Read and write</em>. Leave everything else as it is.</li>
+        <li>Generate it and copy the token (it starts with <code>github_pat_</code>).
+          Paste it below on <em>each</em> device you use.</li>
+      </ol>
+    </details>
+    <div class="sync-form">
+      <label>GitHub username<input id="s-owner" autocomplete="off" autocapitalize="off"
+        spellcheck="false" value="${esc(c.owner || '')}"></label>
+      <label>Private repository<input id="s-repo" autocomplete="off" autocapitalize="off"
+        spellcheck="false" value="${esc(c.repo || 'grammar-data')}"></label>
+      <label>Access token<input id="s-token" type="password" autocomplete="off"
+        autocapitalize="off" spellcheck="false" placeholder="github_pat_\u2026"></label>
+    </div>
+    <div class="btnrow"><button class="btn go sm" id="sync-connect">Connect</button></div>
+    <p class="eyebrow" id="sync-msg" style="margin:0">The token stays in this browser only.
+      It isn\u2019t included in backups or in the synced file.</p>
+  </section>`;
+}
+
+function wireSyncPanel(){
+  const now = document.getElementById('sync-now');
+  if (now) now.onclick = () => Sync.run();
+  const off = document.getElementById('sync-off');
+  if (off) off.onclick = () => {
+    if (!confirm('Disconnect this device? Your progress stays here and on GitHub; '
+               + 'this device just stops syncing and forgets the token.')) return;
+    Sync.store(null); Sync.sha = null; Sync.setStatus('off');
+    const n = document.getElementById('savenote');
+    if (n) n.textContent = '180 topics \u00b7 progress saved automatically';
+    renderProgress();
+  };
+  const go = document.getElementById('sync-connect');
+  if (!go) return;
+  go.onclick = async () => {
+    const msg = document.getElementById('sync-msg');
+    const owner = document.getElementById('s-owner').value.trim();
+    const repo = document.getElementById('s-repo').value.trim();
+    const token = document.getElementById('s-token').value.trim();
+    const say = t => { msg.textContent = t; };
+    if (!/^[A-Za-z0-9-]+$/.test(owner)) return say('Enter your GitHub username.');
+    if (!/^[A-Za-z0-9._-]+$/.test(repo)) return say('Enter the repository name, e.g. grammar-data.');
+    if (token.length < 20) return say('Paste the access token.');
+    go.disabled = true; say('Checking\u2026');
+
+    const prev = Sync.cfg;
+    Sync.cfg = { owner, repo, token, branch: 'main', path: 'pocket-grammar/progress.json' };
+    try{
+      const r = await fetch(Sync.api(''), { headers: Sync.headers(), cache: 'no-store' });
+      if (!r.ok) throw { status: r.status, body: await r.text() };
+      const info = await r.json();
+      Sync.cfg.branch = info.default_branch || 'main';
+      if (!info.private && !confirm('\u201c' + repo + '\u201d is a PUBLIC repository \u2014 anyone could '
+          + 'read your progress and edits. Use it anyway? (A private repository is recommended.)')){
+        Sync.cfg = prev; go.disabled = false; return say('Cancelled \u2014 choose a private repository.');
+      }
+      Sync.store(Sync.cfg);
+      await Sync.run();
+      if (Sync.state === 'error'){
+        say('Connected, but: ' + Sync.note);
+      } else {
+        toast('Sync is on');
+      }
+      renderProgress();
+    }catch(e){
+      Sync.cfg = prev;
+      go.disabled = false;
+      say(e && e.status ? 'Couldn\u2019t connect: ' + Sync.explain(e.status, e.body)
+                        : 'Couldn\u2019t reach GitHub \u2014 check your connection.');
+    }
+  };
+}
+
+/* ---------------- triggers ---------------- */
+document.addEventListener('visibilitychange', () => {
+  if (!Sync.on()) return;
+  if (document.visibilityState === 'hidden') Sync.run();       // leaving: push now
+  else Sync.schedule(300);                                      // back: pick up other devices
+});
+window.addEventListener('online', () => Sync.schedule(500));
 
 /* ============================ view routing ============================ */
 const app = document.getElementById('app');
@@ -1651,6 +2006,8 @@ function renderProgress(){
       </div>`).join('')}
     </section>` : ''}
 
+    ${syncPanelHTML()}
+
     <section class="panel pad stack">
       <h3 style="font-family:var(--serif);font-size:20px">Your data</h3>
       <p class="lede" style="margin:0">Progress is stored in this browser. Export a backup
@@ -1687,6 +2044,7 @@ function renderProgress(){
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
   };
   document.getElementById('copy').onclick = () => copyBackup(JSON.stringify(S));
+  wireSyncPanel();
   document.getElementById('imp').onclick = () => {
     const pasted = document.getElementById('paste');
     if (pasted.style.display === 'block' && pasted.value.trim()){
@@ -1746,8 +2104,10 @@ window.addEventListener('error', e => {
   const saved = await Store.init();
   if (saved) S = Object.assign(S, saved);
   if (!S.edits) S.edits = {};
+  if (!S.editsAt) S.editsAt = {};
   TOPICS.forEach(indexTopic);
   rebuildPools();
+  Sync.load();
   const note = document.getElementById('savenote');
   note.textContent = Store.mode === 'memory'
     ? '180 topics \u00b7 progress won\u2019t be saved here \u2014 download the file to keep it'
@@ -1755,6 +2115,7 @@ window.addEventListener('error', e => {
   current = S.last || 1;
   render();
   app.dataset.ok = '1';
+  if (Sync.on()) Sync.run();
 })();
 
 </script>
